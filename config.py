@@ -33,9 +33,34 @@ ALERTS_DIR.mkdir(parents=True, exist_ok=True)
 ASSETS_DIR.mkdir(parents=True, exist_ok=True)
 
 # ── Video Source ────────────────────────────────────────────────────────────
-_raw_source = os.getenv("SOURCE", "0")
-# Convert to int if it's a pure digit (webcam index)
-SOURCE = int(_raw_source) if _raw_source.strip().isdigit() else _raw_source
+# Three named source params — set SOURCE_TYPE to activate one:
+#   SOURCE_TYPE=webcam   → uses WEBCAM_INDEX (default: 0)
+#   SOURCE_TYPE=file     → uses VIDEO_FILE path
+#   SOURCE_TYPE=youtube  → uses YOUTUBE_URL (resolved via yt-dlp at runtime)
+#
+# Legacy single-value fallback: set SOURCE directly (still works).
+
+SOURCE_TYPE: str = os.getenv("SOURCE_TYPE", "").strip().lower()  # webcam|file|youtube|""
+WEBCAM_INDEX: int = int(os.getenv("WEBCAM_INDEX", "0"))
+VIDEO_FILE: str = os.getenv("VIDEO_FILE", "").strip()
+YOUTUBE_URL: str = os.getenv("YOUTUBE_URL", "").strip()
+YOUTUBE_QUALITY: str = os.getenv("YOUTUBE_QUALITY", "best[height<=720]").strip()
+
+# Resolve the effective SOURCE used by the rest of the pipeline
+if SOURCE_TYPE == "webcam":
+    SOURCE: int | str = WEBCAM_INDEX
+elif SOURCE_TYPE == "file":
+    if not VIDEO_FILE:
+        raise ValueError("SOURCE_TYPE=file requires VIDEO_FILE to be set in .env")
+    SOURCE = VIDEO_FILE
+elif SOURCE_TYPE == "youtube":
+    if not YOUTUBE_URL:
+        raise ValueError("SOURCE_TYPE=youtube requires YOUTUBE_URL to be set in .env")
+    SOURCE = YOUTUBE_URL          # StreamReader will resolve this to a direct URL
+else:
+    # Legacy / raw SOURCE override (backward-compatible)
+    _raw_source = os.getenv("SOURCE", "0")
+    SOURCE = int(_raw_source) if _raw_source.strip().isdigit() else _raw_source
 
 # ── YOLO ────────────────────────────────────────────────────────────────────
 YOLO_MODEL: str = os.getenv("YOLO_MODEL", "yolov8n.pt")
@@ -75,8 +100,9 @@ FPS_LIMIT: int = int(os.getenv("FPS_LIMIT", "15"))
 
 def summary() -> str:
     """Return a human-readable config summary for startup logs."""
+    _type_label = SOURCE_TYPE if SOURCE_TYPE else "auto"
     return (
-        f"  Source         : {SOURCE}\n"
+        f"  Source         : {SOURCE}  [{_type_label}]\n"
         f"  YOLO model     : {YOLO_MODEL}  conf={YOLO_CONF}\n"
         f"  Buffer         : {BUFFER_SIZE} frames @ {CLIP_SIZE}x{CLIP_SIZE}px\n"
         f"  Gate           : alpha={GATE_ALPHA}  min_people={GATE_MIN_PEOPLE}\n"

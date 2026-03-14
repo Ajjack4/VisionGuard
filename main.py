@@ -176,7 +176,7 @@ def run(source_override: Optional[str] = None) -> None:
     from pipeline.alert import AlertEngine
     from api.server import app as api_app, set_alert_engine, set_classifier, update_stream_status
 
-    reader = StreamReader(config.SOURCE)
+    reader = StreamReader(config.SOURCE, youtube_quality=config.YOUTUBE_QUALITY)
     if not reader.connect():
         print(f"{_RED}Failed to connect to video source. Exiting.{_RESET}")
         sys.exit(1)

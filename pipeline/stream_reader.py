@@ -1,6 +1,6 @@
 """
 VisionGuard AI — Stream Reader
-Handles webcam, IP Webcam (Android), RTSP, and file video sources.
+Handles webcam, IP Webcam (Android), RTSP, file, and YouTube live sources.
 """
 
 from __future__ import annotations
@@ -13,23 +13,81 @@ import cv2
 import numpy as np
 
 
+def _resolve_youtube(url: str, quality: str = "best[height<=720]") -> str:
+    """
+    Use yt-dlp to extract the direct stream URL from a YouTube URL.
+
+    Works for both live streams and regular videos.
+    Falls back to 'best' format if the quality selector yields nothing.
+
+    Requires: pip install yt-dlp
+    """
+    try:
+        import yt_dlp
+    except ImportError:
+        raise ImportError(
+            "yt-dlp is required for YouTube sources.\n"
+            "Install it with:  pip install yt-dlp"
+        )
+
+    ydl_opts = {
+        "format": quality,
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+    }
+
+    print(f"[StreamReader] Resolving YouTube URL (quality={quality}) …")
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        try:
+            info = ydl.extract_info(url, download=False)
+        except yt_dlp.utils.DownloadError:
+            # Retry with unrestricted format
+            print("[StreamReader] Quality selector failed, retrying with 'best' …")
+            ydl_opts["format"] = "best"
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl2:
+                info = ydl2.extract_info(url, download=False)
+
+    # For playlists/live streams the direct URL lives in 'url'
+    direct_url: str = info.get("url") or info["formats"][-1]["url"]
+    title: str = info.get("title", "YouTube stream")
+    print(f"[StreamReader] Resolved: '{title}'")
+    return direct_url
+
+
+def _is_youtube_url(s: str) -> bool:
+    return any(
+        domain in s
+        for domain in ("youtube.com/", "youtu.be/", "youtube.com/live")
+    )
+
+
 class StreamReader:
     """
     Unified video source reader.
 
     Accepted sources
     ----------------
-    * int / "0"           — webcam index
-    * "http://IP:8080/video"  — Android IP Webcam app
-    * "rtsp://…"          — RTSP IP camera
-    * "/path/to/file.mp4" — video file
+    * int / "0"                     — webcam index
+    * "http://IP:8080/video"        — Android IP Webcam app
+    * "rtsp://…"                    — RTSP IP camera
+    * "/path/to/file.mp4"           — local video file
+    * "https://youtube.com/…"       — YouTube video or live stream (via yt-dlp)
     """
 
-    def __init__(self, source: Union[int, str]):
-        self.source = source
+    def __init__(self, source: Union[int, str], youtube_quality: str = "best[height<=720]"):
+        self._original_source = source
+        self._youtube_quality = youtube_quality
         self._cap: cv2.VideoCapture | None = None
         self._connected: bool = False
-        self._source_label: str = self._make_label(source)
+
+        # Resolve YouTube URLs to a direct stream URL before opening
+        if isinstance(source, str) and _is_youtube_url(source):
+            self.source = _resolve_youtube(source, youtube_quality)
+            self._source_label = f"YouTube ({source})"
+        else:
+            self.source = source
+            self._source_label = self._make_label(source)
 
     # ── Public API ──────────────────────────────────────────────────────────
 
@@ -99,6 +157,8 @@ class StreamReader:
         s = str(source)
         if s.isdigit():
             return f"Webcam #{s}"
+        if _is_youtube_url(s):
+            return f"YouTube ({s})"
         if s.startswith("rtsp://"):
             return "RTSP Camera"
         if "/video" in s or "IP_WEBCAM" in s.upper():
