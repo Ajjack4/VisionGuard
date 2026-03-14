@@ -38,11 +38,14 @@ class ProximityGate:
 
     def evaluate(self, tracks: List[Track]) -> List[Tuple[Track, Track]]:
         """
-        Check all confirmed track pairs for proximity.
+        Return a set of unique proximate pairs using greedy nearest-first matching.
+
+        Each person is assigned to at most one pair — the closest partner wins.
+        This prevents one person appearing in multiple classifiers simultaneously.
 
         Returns
         -------
-        List of (Track, Track) tuples that are proximate.
+        List of (Track, Track) — non-overlapping pairs, sorted nearest-first.
         Empty list when the gate is closed.
         """
         confirmed = [t for t in tracks if t.is_confirmed()]
@@ -51,11 +54,23 @@ class ProximityGate:
         if len(confirmed) < self.min_people:
             return self._proximate_pairs
 
+        # Collect all proximate candidates with their centroid distance
+        candidates: List[Tuple[float, Track, Track]] = []
         for i in range(len(confirmed)):
             for j in range(i + 1, len(confirmed)):
                 t1, t2 = confirmed[i], confirmed[j]
                 if self._are_proximate(t1.bbox, t2.bbox):
-                    self._proximate_pairs.append((t1, t2))
+                    dist = self._centroid_distance(t1.bbox, t2.bbox)
+                    candidates.append((dist, t1, t2))
+
+        # Greedy matching: closest pair first, each person used at most once
+        candidates.sort(key=lambda x: x[0])
+        used: set = set()
+        for _dist, t1, t2 in candidates:
+            if t1.track_id not in used and t2.track_id not in used:
+                self._proximate_pairs.append((t1, t2))
+                used.add(t1.track_id)
+                used.add(t2.track_id)
 
         return self._proximate_pairs
 

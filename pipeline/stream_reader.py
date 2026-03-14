@@ -94,6 +94,13 @@ class StreamReader:
     def connect(self) -> bool:
         """Open the video source.  Returns True on success."""
         self._cap = cv2.VideoCapture(self.source)
+
+        # For network streams (YouTube, RTSP, IP Webcam) keep the internal
+        # OpenCV buffer at 1 frame so we always process the latest frame
+        # rather than a queue of old ones — dramatically reduces latency.
+        if isinstance(self.source, str) and not Path(self.source).exists():
+            self._cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
         # Give USB / network sources a moment to negotiate
         time.sleep(0.3)
         self._connected = self._cap.isOpened()

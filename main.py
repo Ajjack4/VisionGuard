@@ -33,6 +33,90 @@ _RESET = "\033[0m"
 # ── Alert flash state ─────────────────────────────────────────────────────────
 _alert_flash_until: float = 0.0
 
+# ── Classifier debug helpers ──────────────────────────────────────────────────
+_IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+_IMAGENET_STD  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+
+
+def _denorm_to_bgr(crop_hwc: np.ndarray) -> np.ndarray:
+    """Reverse ImageNet normalisation and convert RGB float32 → BGR uint8."""
+    rgb = (crop_hwc * _IMAGENET_STD + _IMAGENET_MEAN).clip(0.0, 1.0)
+    return cv2.cvtColor((rgb * 255).astype(np.uint8), cv2.COLOR_RGB2BGR)
+
+
+def _make_contact_sheet(frames: list, buffer_size: int, cols: int = 8) -> np.ndarray:
+    """
+    Tile `buffer_size` normalised crop frames into a contact-sheet image.
+    Slots not yet filled are rendered as a dark placeholder with a frame index.
+    """
+    cell = config.CLIP_SIZE
+    rows = (buffer_size + cols - 1) // cols
+    sheet = np.zeros((rows * cell, cols * cell, 3), dtype=np.uint8)
+    for idx in range(buffer_size):
+        r, c = divmod(idx, cols)
+        y0, x0 = r * cell, c * cell
+        if idx < len(frames):
+            sheet[y0:y0 + cell, x0:x0 + cell] = _denorm_to_bgr(frames[idx])
+        else:
+            sheet[y0:y0 + cell, x0:x0 + cell] = 28  # dark grey placeholder
+            cv2.putText(
+                sheet, str(idx + 1),
+                (x0 + cell // 2 - 8, y0 + cell // 2 + 6),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (70, 70, 70), 1,
+            )
+    return sheet
+
+
+def _show_classifier_view(pair_buffer, pairs: list, confidence_map: dict) -> None:
+    """
+    Open / refresh a "Classifier View" window that shows:
+    • A contact sheet of the crop frames currently in each pair's ring buffer
+      (what the 3D-CNN classifier will see when the buffer is full).
+    • The buffer fill level and latest violence confidence per pair.
+    """
+    panels = []
+
+    for t1, t2 in pairs:
+        pair_key = (min(t1.track_id, t2.track_id), max(t1.track_id, t2.track_id))
+        buf = pair_buffer._buffers.get(pair_key)
+        frames_list = list(buf) if buf else []
+
+        sheet = _make_contact_sheet(frames_list, config.BUFFER_SIZE, cols=8)
+
+        conf = confidence_map.get(pair_key)
+        conf_str = f"{conf:.1%}" if conf is not None else "waiting…"
+        header_txt = (
+            f"Pair #{t1.track_id} + #{t2.track_id}   "
+            f"[{len(frames_list)}/{config.BUFFER_SIZE} frames buffered]   "
+            f"P(violent) = {conf_str}"
+        )
+        header = np.zeros((30, sheet.shape[1], 3), dtype=np.uint8)
+        cv2.putText(
+            header, header_txt, (6, 20),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.52, (200, 200, 200), 1,
+        )
+        panels.append(np.vstack([header, sheet]))
+
+    if not panels:
+        cell = config.CLIP_SIZE
+        blank = np.zeros((60, 8 * cell, 3), dtype=np.uint8)
+        cv2.putText(
+            blank, "Gate CLOSED — no proximate pairs detected",
+            (10, 36), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (100, 100, 100), 1,
+        )
+        panels.append(blank)
+
+    # Pad all panels to the same width, then stack vertically
+    max_w = max(p.shape[1] for p in panels)
+    padded = []
+    for p in panels:
+        if p.shape[1] < max_w:
+            pad = np.zeros((p.shape[0], max_w - p.shape[1], 3), dtype=np.uint8)
+            p = np.hstack([p, pad])
+        padded.append(p)
+
+    cv2.imshow("VisionGuard — Classifier View", np.vstack(padded))
+
 
 # ── Annotation helpers ────────────────────────────────────────────────────────
 
@@ -44,6 +128,7 @@ def draw_annotations(
     last_confidence: float,
     fps: float,
     alert_active: bool,
+    merged_bboxes: Optional[List[list]] = None,
 ) -> np.ndarray:
     """
     Draw all HUD elements, bounding boxes, and overlays onto *frame*.
@@ -81,6 +166,18 @@ def draw_annotations(
             (x1 + 2, y1 - 4),
             cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1,
         )
+
+    # ── Merged bounding boxes (region fed to the classifier) ──────────────────
+    # Drawn in magenta so they're visually distinct from the per-person boxes.
+    if merged_bboxes:
+        for mbbox in merged_bboxes:
+            mx1, my1, mx2, my2 = mbbox
+            cv2.rectangle(out, (mx1, my1), (mx2, my2), (255, 0, 255), 2)
+            cv2.putText(
+                out, "CLASSIFYING",
+                (mx1 + 4, my1 - 6),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 0, 255), 1,
+            )
 
     # ── VIOLENCE DETECTED overlay ─────────────────────────────────────────────
     if alert_active:
@@ -184,6 +281,7 @@ def run(source_override: Optional[str] = None) -> None:
     detector = HumanDetector(
         model_path=config.YOLO_MODEL,
         conf_threshold=config.YOLO_CONF,
+        device=config.DEVICE,
     )
     tracker = PersonTracker(max_age=config.TRACK_MAX_AGE)
     gate = ProximityGate(alpha=config.GATE_ALPHA, min_people=config.GATE_MIN_PEOPLE)
@@ -197,6 +295,7 @@ def run(source_override: Optional[str] = None) -> None:
     )
     classifier = ClipClassifier(
         model_path_or_module=config.MODEL_PATH,
+        device=config.DEVICE,
         threshold=config.CLASSIFIER_THRESHOLD,
     )
     alert_engine = AlertEngine(
@@ -235,16 +334,29 @@ def run(source_override: Optional[str] = None) -> None:
     last_confidence: float = 0.0
     alert_active: bool = False
     recent_bgr_frames: deque = deque(maxlen=5 * config.FPS_LIMIT)  # ~5 s of frames
+    last_annotated: Optional[np.ndarray] = None  # reused on skipped frames
+
+    # Per-frame state kept across skipped frames
+    tracks: List = []
+    pairs: List = []
+    current_merged_bboxes: List[list] = []   # merged bbox per active pair (keyframe)
+    confidence_map: dict = {}                 # pair_key → latest P(violent)
 
     global _alert_flash_until
 
-    print(f"{_GREEN}[Main] Pipeline running. Press 'q' to quit.{_RESET}\n")
+    frame_count: int = 0
+    print(
+        f"{_GREEN}[Main] Pipeline running — "
+        f"frame_skip={config.FRAME_SKIP}  model={config.MODEL_TYPE}. "
+        f"Press 'q' to quit.{_RESET}\n"
+    )
 
     try:
         while True:
             loop_start = time.time()
 
             # ── Read frame ────────────────────────────────────────────────────
+            # Always drain the capture buffer to avoid stale frames.
             frame = reader.read_frame()
             if frame is None:
                 if not reader.is_connected:
@@ -254,6 +366,37 @@ def run(source_override: Optional[str] = None) -> None:
                 continue
 
             recent_bgr_frames.append(frame.copy())
+
+            # ── FPS calculation (on every frame) ──────────────────────────────
+            now = time.time()
+            elapsed = now - last_frame_time
+            fps_window.append(elapsed)
+            fps = len(fps_window) / sum(fps_window) if fps_window else 0.0
+            last_frame_time = now
+            alert_active = now < _alert_flash_until
+
+            frame_count += 1
+
+            # ── Frame skip: skip detect/track/classify on non-keyframes ───────
+            if frame_count % config.FRAME_SKIP != 0:
+                if config.DISPLAY and last_annotated is not None:
+                    # Show last annotations overlaid on the current raw frame
+                    # (draws boxes on fresh frame to avoid smearing)
+                    display_frame = draw_annotations(
+                        frame=frame,
+                        tracks=tracks,
+                        pairs=pairs,
+                        gate_open=gate.gate_open,
+                        last_confidence=last_confidence,
+                        fps=fps,
+                        alert_active=alert_active,
+                        merged_bboxes=current_merged_bboxes,
+                    )
+                    cv2.imshow("VisionGuard AI", display_frame)
+                    if cv2.waitKey(1) & 0xFF == ord("q"):
+                        print("[Main] Quit key pressed.")
+                        break
+                continue
 
             # ── Detect ───────────────────────────────────────────────────────
             detections = detector.detect(frame)
@@ -273,13 +416,16 @@ def run(source_override: Optional[str] = None) -> None:
             track_buffer.cleanup_stale(active_track_ids)
             pair_buffer.cleanup_stale(active_pair_keys)
 
-            alert_fired_this_frame = False
+            # Prune confidence map for pairs that are no longer active
+            for k in [k for k in confidence_map if k not in active_pair_keys]:
+                del confidence_map[k]
 
+            current_merged_bboxes = []
             if gate.gate_open:
                 for t1, t2 in pairs:
                     merged_bbox = gate.get_merged_bbox(t1.bbox, t2.bbox)
+                    current_merged_bboxes.append(merged_bbox)
 
-                    # Individual crops for per-track buffers
                     crop1 = detector.extract_crop(
                         frame, t1.bbox, clip_size=config.CLIP_SIZE
                     )
@@ -300,6 +446,7 @@ def run(source_override: Optional[str] = None) -> None:
                         clip = pair_buffer.get_clip(pair_key)
                         confidence = classifier.predict(clip)
                         last_confidence = confidence
+                        confidence_map[pair_key] = confidence
 
                         fired = alert_engine.update(
                             camera_id=reader.source_label,
@@ -309,17 +456,16 @@ def run(source_override: Optional[str] = None) -> None:
                             clip_frames=list(recent_bgr_frames),
                         )
                         if fired:
-                            alert_fired_this_frame = True
                             _alert_flash_until = time.time() + 2.0
+                            alert_active = True
 
-            alert_active = time.time() < _alert_flash_until
-
-            # ── FPS calculation ───────────────────────────────────────────────
-            now = time.time()
-            elapsed = now - last_frame_time
-            fps_window.append(elapsed)
-            fps = len(fps_window) / sum(fps_window) if fps_window else 0.0
-            last_frame_time = now
+            # ── Classifier debug view ─────────────────────────────────────────
+            if config.DEBUG_CROPS:
+                _show_classifier_view(pair_buffer, pairs, confidence_map)
+                if not config.DISPLAY:
+                    if cv2.waitKey(1) & 0xFF == ord("q"):
+                        print("[Main] Quit key pressed.")
+                        break
 
             # ── Update API state ──────────────────────────────────────────────
             update_stream_status(
@@ -331,7 +477,7 @@ def run(source_override: Optional[str] = None) -> None:
 
             # ── Display ───────────────────────────────────────────────────────
             if config.DISPLAY:
-                annotated = draw_annotations(
+                last_annotated = draw_annotations(
                     frame=frame,
                     tracks=tracks,
                     pairs=pairs,
@@ -339,8 +485,9 @@ def run(source_override: Optional[str] = None) -> None:
                     last_confidence=last_confidence,
                     fps=fps,
                     alert_active=alert_active,
+                    merged_bboxes=current_merged_bboxes,
                 )
-                cv2.imshow("VisionGuard AI", annotated)
+                cv2.imshow("VisionGuard AI", last_annotated)
                 key = cv2.waitKey(1) & 0xFF
                 if key == ord("q"):
                     print("[Main] Quit key pressed.")

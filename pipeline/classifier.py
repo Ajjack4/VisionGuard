@@ -47,28 +47,53 @@ class ClipClassifier:
     # ── Model loading ────────────────────────────────────────────────────────
 
     def _load_model(self, source: Union[str, nn.Module, None]) -> nn.Module:
-        from models.r3d_classifier import build_model
+        import config
 
-        if source is None:
-            # Default: Kinetics-pretrained backbone, no fine-tuning
-            model = build_model(
-                pretrained=True,
+        # Injected nn.Module — use directly regardless of MODEL_TYPE
+        if isinstance(source, nn.Module):
+            return source.to(self.device)
+
+        model_type = config.MODEL_TYPE
+
+        # ── kinetics_heuristic: zero-shot, works immediately ──────────────────
+        if model_type == "kinetics_heuristic":
+            from models.kinetics_heuristic import build_heuristic_model
+            return build_heuristic_model(
+                backbone="r3d_18",
+                score_scale=config.KINETICS_SCORE_SCALE,
                 device=self.device,
             )
-        elif isinstance(source, str):
-            model = build_model(
-                pretrained=True,
-                state_dict_path=source,
+
+        # ── X3D / SlowFast via torch.hub ──────────────────────────────────────
+        if model_type in ("x3d_xs", "x3d_s", "x3d_m", "slowfast_r50"):
+            from models.kinetics_heuristic import build_heuristic_model
+            return build_heuristic_model(
+                backbone=model_type,
+                score_scale=config.KINETICS_SCORE_SCALE,
                 device=self.device,
             )
-        elif isinstance(source, nn.Module):
-            model = source.to(self.device)
-        else:
-            raise TypeError(
-                f"model_path_or_module must be str, nn.Module, or None. "
-                f"Got: {type(source)}"
+
+        # ── r3d18: binary head, requires fine-tuning to be useful ─────────────
+        if model_type == "r3d18":
+            from models.r3d_classifier import build_model
+            state_dict = source if isinstance(source, str) else config.MODEL_PATH
+            return build_model(
+                pretrained=True,
+                state_dict_path=state_dict,
+                device=self.device,
             )
-        return model
+
+        # Unknown — fall back with warning
+        print(
+            f"[Classifier] WARNING: unknown MODEL_TYPE='{model_type}'. "
+            "Falling back to kinetics_heuristic."
+        )
+        from models.kinetics_heuristic import build_heuristic_model
+        return build_heuristic_model(
+            backbone="r3d_18",
+            score_scale=config.KINETICS_SCORE_SCALE,
+            device=self.device,
+        )
 
     def swap_model(self, new_model: nn.Module) -> None:
         """Hot-swap the underlying model at runtime (e.g. after fine-tuning)."""
