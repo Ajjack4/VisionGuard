@@ -56,10 +56,9 @@ def _bgr_to_rgb(img: np.ndarray) -> np.ndarray:
 # ── Shared state (pipeline thread ↔ Streamlit UI) ────────────────────────────
 
 @dataclass
-class PairPanel:
-    id1: int
-    id2: int
-    confidence: Optional[float]    # None until buffer is full
+class ScenePanel:
+    track_ids: list              # all track IDs in this group (2+)
+    confidence: Optional[float]  # None until buffer is full
     n_frames: int
     buffer_size: int
     crop_rgb: Optional[np.ndarray]     # merged region crop — current frame (RGB)
@@ -70,7 +69,7 @@ class PairPanel:
 class AppState:
     lock: threading.Lock = field(default_factory=threading.Lock)
     main_frame_rgb: Optional[np.ndarray] = None
-    panels: List[PairPanel] = field(default_factory=list)
+    panels: List[ScenePanel] = field(default_factory=list)
     fps: float = 0.0
     track_count: int = 0
     gate_open: bool = False
@@ -194,7 +193,6 @@ def _run_pipeline(state: AppState) -> None:
     last_frame_time       = time.time()
     alert_flash_until     = 0.0
     tracks                = []
-    pairs                 = []
     state.status          = "running"
 
     while True:
@@ -218,51 +216,48 @@ def _run_pipeline(state: AppState) -> None:
         if frame_count % config.FRAME_SKIP != 0:
             continue
 
-        # ── Detect + Track + Gate ─────────────────────────────────────────────
+        # ── Detect + Track ────────────────────────────────────────────────────
         detections = detector.detect(frame)
         tracks     = tracker.update(detections, frame)
-        pairs      = gate.evaluate(tracks)
 
-        active_pair_keys = {
-            (min(t1.track_id, t2.track_id), max(t1.track_id, t2.track_id))
-            for t1, t2 in pairs
+        # ── Gate: connected-component groups ─────────────────────────────────
+        groups = gate.evaluate_groups(tracks)
+        active_group_keys = {
+            tuple(sorted(t.track_id for t in g)) for g in groups
         }
         track_buf.cleanup_stale({t.track_id for t in tracks if t.is_confirmed()})
-        pair_buf.cleanup_stale(active_pair_keys)
-        for k in [k for k in confidence_map if k not in active_pair_keys]:
+        pair_buf.cleanup_stale(active_group_keys)
+        for k in [k for k in confidence_map if k not in active_group_keys]:
             del confidence_map[k]
 
-        # ── Per-pair classification ───────────────────────────────────────────
-        new_panels: List[PairPanel] = []
-        merged_bboxes: List[list]   = []
+        # ── Per-group classification (handles 2, 3, N people) ────────────────
+        new_panels: List[ScenePanel] = []
+        merged_bboxes: List[list]    = []
 
         if gate.gate_open:
-            for t1, t2 in pairs:
-                merged_bbox = gate.get_merged_bbox(t1.bbox, t2.bbox)
-                merged_bboxes.append(merged_bbox)
+            for group in groups:
+                group_bbox = gate.get_group_bbox(group)
+                merged_bboxes.append(group_bbox)
 
-                crop1       = detector.extract_crop(frame, t1.bbox,
-                                                    clip_size=config.CLIP_SIZE)
-                crop2       = detector.extract_crop(frame, t2.bbox,
-                                                    clip_size=config.CLIP_SIZE)
-                merged_crop = detector.extract_crop(frame, merged_bbox,
-                                                    padding=0.05,
-                                                    clip_size=config.CLIP_SIZE)
+                for t in group:
+                    crop = detector.extract_crop(frame, t.bbox,
+                                                 clip_size=config.CLIP_SIZE)
+                    track_buf.update(t.track_id, crop)
 
-                track_buf.update(t1.track_id, crop1)
-                track_buf.update(t2.track_id, crop2)
-                pair_key = (min(t1.track_id, t2.track_id),
-                            max(t1.track_id, t2.track_id))
-                pair_buf.update(pair_key, merged_crop)
+                group_crop = detector.extract_crop(frame, group_bbox,
+                                                   padding=0.05,
+                                                   clip_size=config.CLIP_SIZE)
+                group_key = tuple(sorted(t.track_id for t in group))
+                pair_buf.update(group_key, group_crop)
 
-                if pair_buf.is_ready(pair_key):
-                    clip       = pair_buf.get_clip(pair_key)
+                if pair_buf.is_ready(group_key):
+                    clip       = pair_buf.get_clip(group_key)
                     confidence = classifier.predict(clip)
-                    confidence_map[pair_key] = confidence
+                    confidence_map[group_key] = confidence
 
                     fired = alerts.update(
                         camera_id=reader.source_label,
-                        track_pair=(t1.track_id, t2.track_id),
+                        track_pair=group_key,
                         confidence=confidence,
                         frame=frame,
                         clip_frames=list(recent_bgr),
@@ -271,14 +266,13 @@ def _run_pipeline(state: AppState) -> None:
                         alert_flash_until = time.time() + 2.0
                         alert_active = True
 
-                buf_frames = list(pair_buf._buffers.get(pair_key, []))
-                crop_bgr   = _denorm(merged_crop)
+                buf_frames = list(pair_buf._buffers.get(group_key, []))
+                crop_bgr   = _denorm(group_crop)
                 contact    = _make_contact(buf_frames, config.BUFFER_SIZE)
 
-                new_panels.append(PairPanel(
-                    id1=t1.track_id,
-                    id2=t2.track_id,
-                    confidence=confidence_map.get(pair_key),
+                new_panels.append(ScenePanel(
+                    track_ids=[t.track_id for t in group],
+                    confidence=confidence_map.get(group_key),
                     n_frames=len(buf_frames),
                     buffer_size=config.BUFFER_SIZE,
                     crop_rgb=_bgr_to_rgb(crop_bgr),
@@ -286,7 +280,7 @@ def _run_pipeline(state: AppState) -> None:
                 ))
 
         # ── Push annotated frame to shared state ──────────────────────────────
-        annotated = _draw_main(frame, tracks, pairs, merged_bboxes, alert_active, fps)
+        annotated = _draw_main(frame, tracks, groups, merged_bboxes, alert_active, fps)
 
         with state.lock:
             state.main_frame_rgb = _bgr_to_rgb(annotated)
@@ -328,26 +322,26 @@ def _render(state: AppState) -> None:
     else:
         st.caption("Waiting for first frame…")
 
-    # ── Per-pair classifier panels ────────────────────────────────────────────
+    # ── Per-group classifier panels ───────────────────────────────────────────
     st.divider()
     if panels:
-        st.subheader(f"Active classifiers — {len(panels)} pair(s)")
+        st.subheader(f"Active classifiers — {len(panels)} group(s)")
         cols = st.columns(len(panels))
         for col, p in zip(cols, panels):
             with col:
                 conf = p.confidence
                 is_alert = conf is not None and conf >= config.CLASSIFIER_THRESHOLD
                 badge = "🔴" if is_alert else ("🟡" if conf is not None else "⏳")
+                ids_str = " + ".join(f"#{i}" for i in p.track_ids)
 
-                st.markdown(f"### {badge} Pair #{p.id1} + #{p.id2}")
+                st.markdown(f"### {badge} Group {ids_str}")
+                st.caption(f"{len(p.track_ids)} people in this cluster")
 
-                # Merged crop — what the model actually receives each frame
                 if p.crop_rgb is not None:
                     st.image(p.crop_rgb,
-                             caption="Merged crop fed to classifier (current frame)",
+                             caption="Group region fed to classifier (current frame)",
                              width='stretch')
 
-                # Confidence / buffer-fill bar
                 if conf is not None:
                     colour_label = "🔴 VIOLENT" if is_alert else "🟡 non-violent"
                     st.progress(float(min(1.0, conf)),
@@ -358,7 +352,6 @@ def _render(state: AppState) -> None:
                     st.progress(float(fill),
                                 text=f"Buffering… {p.n_frames}/{p.buffer_size} frames")
 
-                # Temporal contact sheet — all frames the next classification will use
                 if p.contact_rgb is not None:
                     st.image(p.contact_rgb,
                              caption=(
@@ -368,8 +361,8 @@ def _render(state: AppState) -> None:
                              width='stretch')
     else:
         st.caption(
-            "No proximate pairs detected — classifier is idle. "
-            "The gate opens when two tracked people come close together."
+            "No proximate groups detected — classifier is idle. "
+            "The gate opens when 2+ people come close together."
         )
 
 

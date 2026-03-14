@@ -76,17 +76,18 @@ def _show_classifier_view(pair_buffer, pairs: list, confidence_map: dict) -> Non
     """
     panels = []
 
-    for t1, t2 in pairs:
-        pair_key = (min(t1.track_id, t2.track_id), max(t1.track_id, t2.track_id))
-        buf = pair_buffer._buffers.get(pair_key)
+    for group in pairs:  # `pairs` is now List[List[Track]] when called from new code
+        group_key = tuple(sorted(t.track_id for t in group))
+        buf = pair_buffer._buffers.get(group_key)
         frames_list = list(buf) if buf else []
 
         sheet = _make_contact_sheet(frames_list, config.BUFFER_SIZE, cols=8)
 
-        conf = confidence_map.get(pair_key)
+        conf = confidence_map.get(group_key)
         conf_str = f"{conf:.1%}" if conf is not None else "waiting…"
+        ids_str = " + ".join(f"#{t.track_id}" for t in group)
         header_txt = (
-            f"Pair #{t1.track_id} + #{t2.track_id}   "
+            f"Group {ids_str}   "
             f"[{len(frames_list)}/{config.BUFFER_SIZE} frames buffered]   "
             f"P(violent) = {conf_str}"
         )
@@ -123,7 +124,7 @@ def _show_classifier_view(pair_buffer, pairs: list, confidence_map: dict) -> Non
 def draw_annotations(
     frame: np.ndarray,
     tracks,
-    pairs,
+    groups: List[List],
     gate_open: bool,
     last_confidence: float,
     fps: float,
@@ -138,11 +139,8 @@ def draw_annotations(
     h, w = out.shape[:2]
     now = time.time()
 
-    # Collect track IDs that are in a proximate pair
-    proximate_ids = set()
-    for t1, t2 in pairs:
-        proximate_ids.add(t1.track_id)
-        proximate_ids.add(t2.track_id)
+    # Track IDs that belong to any active group (shown in orange / red)
+    proximate_ids = {t.track_id for g in groups for t in g}
 
     # ── Bounding boxes ────────────────────────────────────────────────────────
     for track in tracks:
@@ -338,9 +336,9 @@ def run(source_override: Optional[str] = None) -> None:
 
     # Per-frame state kept across skipped frames
     tracks: List = []
-    pairs: List = []
-    current_merged_bboxes: List[list] = []   # merged bbox per active pair (keyframe)
-    confidence_map: dict = {}                 # pair_key → latest P(violent)
+    groups: List = []                          # List[List[Track]] — connected components
+    current_merged_bboxes: List[list] = []    # group bbox per active group (keyframe)
+    confidence_map: dict = {}                  # group_key → latest P(violent)
 
     global _alert_flash_until
 
@@ -385,7 +383,7 @@ def run(source_override: Optional[str] = None) -> None:
                     display_frame = draw_annotations(
                         frame=frame,
                         tracks=tracks,
-                        pairs=pairs,
+                        groups=groups,
                         gate_open=gate.gate_open,
                         last_confidence=last_confidence,
                         fps=fps,
@@ -404,53 +402,50 @@ def run(source_override: Optional[str] = None) -> None:
             # ── Track ────────────────────────────────────────────────────────
             tracks = tracker.update(detections, frame)
 
-            # ── Gate ─────────────────────────────────────────────────────────
-            pairs = gate.evaluate(tracks)
-            active_pair_keys = {
-                (min(t1.track_id, t2.track_id), max(t1.track_id, t2.track_id))
-                for t1, t2 in pairs
+            # ── Gate (connected-components grouping) ──────────────────────────
+            groups = gate.evaluate_groups(tracks)
+            active_group_keys = {
+                tuple(sorted(t.track_id for t in g)) for g in groups
             }
 
             # ── Cleanup stale buffers ─────────────────────────────────────────
             active_track_ids = {t.track_id for t in tracks if t.is_confirmed()}
             track_buffer.cleanup_stale(active_track_ids)
-            pair_buffer.cleanup_stale(active_pair_keys)
+            pair_buffer.cleanup_stale(active_group_keys)
 
-            # Prune confidence map for pairs that are no longer active
-            for k in [k for k in confidence_map if k not in active_pair_keys]:
+            # Prune confidence map for groups no longer active
+            for k in [k for k in confidence_map if k not in active_group_keys]:
                 del confidence_map[k]
 
             current_merged_bboxes = []
             if gate.gate_open:
-                for t1, t2 in pairs:
-                    merged_bbox = gate.get_merged_bbox(t1.bbox, t2.bbox)
-                    current_merged_bboxes.append(merged_bbox)
+                for group in groups:
+                    group_bbox = gate.get_group_bbox(group)
+                    current_merged_bboxes.append(group_bbox)
 
-                    crop1 = detector.extract_crop(
-                        frame, t1.bbox, clip_size=config.CLIP_SIZE
-                    )
-                    crop2 = detector.extract_crop(
-                        frame, t2.bbox, clip_size=config.CLIP_SIZE
-                    )
-                    merged_crop = detector.extract_crop(
-                        frame, merged_bbox, padding=0.05, clip_size=config.CLIP_SIZE
-                    )
+                    # Per-track individual crops (for track_buffer)
+                    for t in group:
+                        crop = detector.extract_crop(
+                            frame, t.bbox, clip_size=config.CLIP_SIZE
+                        )
+                        track_buffer.update(t.track_id, crop)
 
-                    track_buffer.update(t1.track_id, crop1)
-                    track_buffer.update(t2.track_id, crop2)
-                    pair_key = (min(t1.track_id, t2.track_id),
-                                max(t1.track_id, t2.track_id))
-                    pair_buffer.update(pair_key, merged_crop)
+                    # Group crop covers ALL members of this cluster
+                    group_crop = detector.extract_crop(
+                        frame, group_bbox, padding=0.05, clip_size=config.CLIP_SIZE
+                    )
+                    group_key = tuple(sorted(t.track_id for t in group))
+                    pair_buffer.update(group_key, group_crop)
 
-                    if pair_buffer.is_ready(pair_key):
-                        clip = pair_buffer.get_clip(pair_key)
+                    if pair_buffer.is_ready(group_key):
+                        clip = pair_buffer.get_clip(group_key)
                         confidence = classifier.predict(clip)
                         last_confidence = confidence
-                        confidence_map[pair_key] = confidence
+                        confidence_map[group_key] = confidence
 
                         fired = alert_engine.update(
                             camera_id=reader.source_label,
-                            track_pair=(t1.track_id, t2.track_id),
+                            track_pair=group_key,
                             confidence=confidence,
                             frame=frame,
                             clip_frames=list(recent_bgr_frames),
@@ -461,7 +456,7 @@ def run(source_override: Optional[str] = None) -> None:
 
             # ── Classifier debug view ─────────────────────────────────────────
             if config.DEBUG_CROPS:
-                _show_classifier_view(pair_buffer, pairs, confidence_map)
+                _show_classifier_view(pair_buffer, groups, confidence_map)
                 if not config.DISPLAY:
                     if cv2.waitKey(1) & 0xFF == ord("q"):
                         print("[Main] Quit key pressed.")
@@ -480,7 +475,7 @@ def run(source_override: Optional[str] = None) -> None:
                 last_annotated = draw_annotations(
                     frame=frame,
                     tracks=tracks,
-                    pairs=pairs,
+                    groups=groups,
                     gate_open=gate.gate_open,
                     last_confidence=last_confidence,
                     fps=fps,
