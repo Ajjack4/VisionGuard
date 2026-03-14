@@ -101,7 +101,7 @@ def _track_colour(track_id, alert_active: bool, proximate_ids: set) -> tuple:
 def _draw_main(
     frame: np.ndarray,
     tracks,
-    pairs,
+    groups,
     merged_bboxes: list,
     alert_active: bool,
     fps: float,
@@ -109,7 +109,7 @@ def _draw_main(
     out = frame.copy()
     h, w = out.shape[:2]
 
-    proximate_ids = {t.track_id for pair in pairs for t in pair}
+    proximate_ids = {t.track_id for group in groups for t in group}
 
     for track in tracks:
         if not track.is_confirmed():

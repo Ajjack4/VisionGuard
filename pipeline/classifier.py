@@ -83,6 +83,28 @@ class ClipClassifier:
                 device=self.device,
             )
 
+        # ── slowfast_violence: fine-tuned SlowFast R50 (train_slowfast.ipynb) ──
+        if model_type == "slowfast_violence":
+            import json
+            from models.slowfast_wrapper import SlowFastWrapper
+            model_path = source if isinstance(source, str) else config.MODEL_PATH
+            meta_path  = (model_path or "").replace(".pt", ".json")
+            alpha      = 4  # default; overridden by saved metadata if present
+            try:
+                with open(meta_path) as f:
+                    meta  = json.load(f)
+                    alpha = meta.get("alpha", alpha)
+            except (FileNotFoundError, ValueError):
+                pass
+            wrapper = SlowFastWrapper(alpha=alpha, num_classes=2)
+            if model_path:
+                state = torch.load(model_path, map_location=self.device, weights_only=True)
+                wrapper.load_state_dict(state)
+                print(f"[Classifier] Loaded slowfast_violence weights from {model_path}")
+            else:
+                print("[Classifier] WARNING: MODEL_PATH not set — using untrained SlowFast weights")
+            return wrapper.to(self.device)
+
         # Unknown — fall back with warning
         print(
             f"[Classifier] WARNING: unknown MODEL_TYPE='{model_type}'. "

@@ -83,10 +83,13 @@ CLASSIFIER_THRESHOLD: float = float(os.getenv("CLASSIFIER_THRESHOLD", "0.65"))
 PERSISTENCE_COUNT: int = int(os.getenv("PERSISTENCE_COUNT", "2"))
 MODEL_PATH: str | None = os.getenv("MODEL_PATH", None) or None
 # MODEL_TYPE controls which classifier backbone is used:
-#   kinetics_heuristic — zero-shot, works immediately (default for PoC)
-#   r3d18              — binary head, requires fine-tuning to be accurate
-#   x3d_xs             — faster Facebook X3D model via torch.hub (PoC)
-#   slowfast_r50       — SlowFast R50 via torch.hub (PoC, more accurate)
+#   kinetics_heuristic  — zero-shot, works immediately (default for PoC)
+#   r3d18               — binary head, requires fine-tuning to be accurate
+#   x3d_xs              — faster Facebook X3D model via torch.hub (PoC)
+#   slowfast_r50        — SlowFast R50 via torch.hub (PoC, more accurate)
+#   slowfast_violence   — fine-tuned SlowFast R50 from train_slowfast.ipynb
+#                         requires MODEL_PATH=models/slowfast_violence.pt
+#                         and BUFFER_SIZE=32
 MODEL_TYPE: str = os.getenv("MODEL_TYPE", "kinetics_heuristic").strip().lower()
 # Score amplifier for kinetics_heuristic mode (higher = more sensitive)
 KINETICS_SCORE_SCALE: float = float(os.getenv("KINETICS_SCORE_SCALE", "6.0"))
